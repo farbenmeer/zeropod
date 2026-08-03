@@ -20,7 +20,6 @@ import (
 	"time"
 
 	containerd "github.com/containerd/containerd/v2/client"
-	"github.com/containerd/containerd/v2/cmd/containerd/server/config"
 	"github.com/coreos/go-systemd/v22/dbus"
 	v1 "github.com/ctrox/zeropod/api/shim/v1"
 	"github.com/ctrox/zeropod/manager/node"
@@ -189,7 +188,7 @@ func installCriu(ctx context.Context) error {
 	if err := client.Install(
 		ctx, image, containerd.WithInstallLibs,
 		containerd.WithInstallReplace,
-		containerd.WithInstallPath(optPath(ctx, containerRuntime(*runtime))),
+		containerd.WithInstallPath(optPath(containerRuntime(*runtime))),
 	); err != nil {
 		return err
 	}
@@ -214,7 +213,7 @@ func installRuntime(ctx context.Context, runtime containerRuntime) error {
 		return fmt.Errorf("unable to connect to dbus: %w", err)
 	}
 
-	opt := optPath(ctx, runtime)
+	opt := optPath(runtime)
 	// note that if the shim binary already exists, we simply switch it out with
 	// the new one but existing zeropods will have to be deleted to use the
 	// updated shim.
@@ -323,13 +322,113 @@ func configureContainerd(ctx context.Context, runtime containerRuntime) (restart
 	return configureContainerdv2(ctx, runtime, defaultContainerdConfigPath)
 }
 
+// containerdConfig is the subset of containerd's configuration that the
+// installer needs: the config version, the imports and the opt plugin path.
+//
+// It is parsed directly instead of going through containerd's own config loader
+// because that loader rejects any config with a version higher than the
+// containerd release the installer was built against — containerd/v2 v2.1 caps
+// at version 3, while containerd v2.3 writes version 4. The installer would then
+// refuse to run on a host whose containerd is newer than the one it vendors,
+// even though the runtime drop-in it writes is perfectly valid there (drop-ins
+// may declare a lower version than the root config and are migrated forward).
+// Parsing only the few fields we care about keeps the installer working against
+// config versions that did not exist when it was built.
+type containerdConfig struct {
+	Version int                       `toml:"version"`
+	Imports []string                  `toml:"imports"`
+	Plugins map[string]map[string]any `toml:"plugins"`
+}
+
+// loadContainerdConfig parses the containerd config at path along with its
+// imports. Imported files only add to the root config, they never override it,
+// which is all the installer needs to detect an existing zeropod import or a
+// pre-configured opt plugin.
+func loadContainerdConfig(path string) (*containerdConfig, error) {
+	conf := &containerdConfig{}
+	if err := decodeContainerdConfig(path, conf); err != nil {
+		return nil, err
+	}
+
+	for _, imp := range resolveImports(path, conf.Imports) {
+		dropIn := &containerdConfig{}
+		if err := decodeContainerdConfig(imp, dropIn); err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				// an import that does not (yet) exist is not fatal, containerd
+				// itself also tolerates it.
+				continue
+			}
+			return nil, err
+		}
+		if dropIn.Version > conf.Version {
+			return nil, fmt.Errorf(
+				"drop-in config %s version %d is higher than root config version %d",
+				imp, dropIn.Version, conf.Version,
+			)
+		}
+		for name, plugin := range dropIn.Plugins {
+			if _, ok := conf.Plugins[name]; ok {
+				continue
+			}
+			if conf.Plugins == nil {
+				conf.Plugins = map[string]map[string]any{}
+			}
+			conf.Plugins[name] = plugin
+		}
+	}
+
+	return conf, nil
+}
+
+func decodeContainerdConfig(path string, out *containerdConfig) error {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	if err := toml.Unmarshal(data, out); err != nil {
+		return fmt.Errorf("failed to load TOML from %s: %w", path, err)
+	}
+	return nil
+}
+
+// resolveImports resolves import paths relative to the config that declares
+// them, the same way containerd does.
+func resolveImports(parent string, imports []string) []string {
+	var out []string
+	for _, path := range imports {
+		path = filepath.Clean(path)
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(filepath.Dir(parent), path)
+		}
+		if strings.Contains(path, "*") {
+			matches, err := filepath.Glob(path)
+			if err != nil {
+				// the only possible error is a malformed pattern, which we
+				// simply skip over as containerd would fail on it anyway.
+				continue
+			}
+			out = append(out, matches...)
+			continue
+		}
+		out = append(out, path)
+	}
+	return out
+}
+
+// optPluginPath returns the path configured for containerd's opt plugin, or an
+// empty string if it is not configured.
+func (c *containerdConfig) optPluginPath() string {
+	path, _ := c.Plugins[containerdOptKey]["path"].(string)
+	return path
+}
+
 func configureContainerdv2(ctx context.Context, runtime containerRuntime, containerdConfig string) (bool, error) {
 	if err := migrateToImports(runtime, containerdConfig); err != nil {
 		return false, fmt.Errorf("migrating to imports: %w", err)
 	}
 
-	conf := &config.Config{}
-	if err := config.LoadConfig(ctx, containerdConfig, conf); err != nil {
+	conf, err := loadContainerdConfig(containerdConfig)
+	if err != nil {
 		return false, fmt.Errorf("loading containerd config: %w", err)
 	}
 
@@ -338,10 +437,8 @@ func configureContainerdv2(ctx context.Context, runtime containerRuntime, contai
 		return false, nil
 	}
 
-	existingOpt, containerdOptPath, err := optConfigured(ctx, containerdConfig)
-	if err != nil {
-		return false, fmt.Errorf("could not check opt configuration: %w", err)
-	}
+	containerdOptPath := conf.optPluginPath()
+	existingOpt := containerdOptPath != ""
 
 	if err := backupContainerdConfig(containerdConfig); err != nil {
 		return false, fmt.Errorf("backing up containerd config: %w", err)
@@ -371,7 +468,7 @@ func configureContainerdv2(ctx context.Context, runtime containerRuntime, contai
 	}
 
 	// sanity check config by loading it again
-	if err := config.LoadConfig(ctx, containerdConfig, &config.Config{}); err != nil {
+	if _, err := loadContainerdConfig(containerdConfig); err != nil {
 		return false, fmt.Errorf("loading modified containerd config: %w", err)
 	}
 
@@ -408,7 +505,7 @@ func configureContainerdv1(ctx context.Context, runtime containerRuntime, contai
 		return false, err
 	}
 
-	configured, containerdOptPath, err := optConfigured(ctx, containerdConfig)
+	configured, containerdOptPath, err := optConfigured(containerdConfig)
 	if err != nil {
 		return false, err
 	}
@@ -435,7 +532,7 @@ func configureContainerdv1(ctx context.Context, runtime containerRuntime, contai
 	return true, nil
 }
 
-func addZeropodConfigImport(containerdConfigPath string, conf *config.Config) error {
+func addZeropodConfigImport(containerdConfigPath string, conf *containerdConfig) error {
 	importsConf := struct {
 		Imports []string `toml:"imports"`
 	}{}
@@ -517,7 +614,11 @@ func backupContainerdConfig(containerdConfig string) error {
 
 func writeZeropodRuntimeConfig(containerdConfig, optPath string, existingOpt bool, version int) error {
 	zeropodRuntimeConfig := fmt.Sprintf("%s\n%s", configVersion2, runtimeConfig)
-	if version == 3 {
+	if version >= 3 {
+		// the CRI plugin was split into io.containerd.cri.v1.runtime/images in
+		// config version 3 and kept those names since. A drop-in may declare a
+		// lower version than the root config, so writing the version 3 form is
+		// also correct for any later version.
 		zeropodRuntimeConfig = runtimeConfigV3
 	}
 
@@ -609,30 +710,21 @@ func copyConfig(from, to string) error {
 	return nil
 }
 
-func optConfigured(ctx context.Context, containerdConfig string) (bool, string, error) {
-	conf := &config.Config{}
-	if err := config.LoadConfig(ctx, containerdConfig, conf); err != nil {
+func optConfigured(containerdConfig string) (bool, string, error) {
+	conf, err := loadContainerdConfig(containerdConfig)
+	if err != nil {
 		return false, "", err
 	}
-	if _, ok := conf.Plugins[containerdOptKey]; ok {
-		optConfig := struct {
-			Path string `toml:"path"`
-		}{}
 
-		if _, err := conf.Decode(ctx, containerdOptKey, &optConfig); err != nil {
-			return false, "", err
-		}
-
-		if optConfig.Path != "" {
-			return true, optConfig.Path, nil
-		}
+	if path := conf.optPluginPath(); path != "" {
+		return true, path, nil
 	}
 
 	return false, "", nil
 }
 
-func optPath(ctx context.Context, runtime containerRuntime) string {
-	ok, path, err := optConfigured(ctx, containerdConfigFile(runtime, defaultContainerdConfigPath))
+func optPath(runtime containerRuntime) string {
+	ok, path, err := optConfigured(containerdConfigFile(runtime, defaultContainerdConfigPath))
 	if err != nil {
 		return defaultOptPath
 	}
@@ -654,7 +746,7 @@ func inClusterClient() (kubernetes.Interface, error) {
 // runUninstall removes all components installed by zeropod and restores the
 // original configuration.
 func runUninstall(ctx context.Context, client kubernetes.Interface, runtime containerRuntime) error {
-	if err := os.RemoveAll(optPath(ctx, runtime)); err != nil {
+	if err := os.RemoveAll(optPath(runtime)); err != nil {
 		return fmt.Errorf("removing opt path: %w", err)
 	}
 
