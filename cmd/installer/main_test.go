@@ -6,7 +6,6 @@ import (
 	"os"
 	"testing"
 
-	"github.com/containerd/containerd/v2/cmd/containerd/server/config"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -59,6 +58,17 @@ version = 2
 `
 	configV3 = `
 version = 3
+`
+	// configV4 is what containerd v2.3 and later write. The installer has to
+	// cope with it even when it is built against an older containerd.
+	configV4 = `
+version = 4
+
+[plugins."io.containerd.cri.v1.runtime".containerd]
+  default_runtime_name = "runc"
+
+[plugins."io.containerd.cri.v1.runtime".containerd.runtimes.runc]
+  runtime_type = "io.containerd.runc.v2"
 `
 	configWithOptPlugin = `
 version = 2
@@ -117,6 +127,11 @@ func TestConfigureContainerd(t *testing.T) {
 		},
 		"v3 config": {
 			containerdConfig: configV3,
+			runtime:          runtimeContainerd,
+			expectedRestart:  true,
+		},
+		"v4 config": {
+			containerdConfig: configV4,
 			runtime:          runtimeContainerd,
 			expectedRestart:  true,
 		},
@@ -194,9 +209,8 @@ func TestConfigureContainerd(t *testing.T) {
 			backupConfig, err := os.ReadFile(configName + configBackupSuffix)
 			require.NoError(err)
 
-			ctx := context.Background()
-			conf := &config.Config{}
-			assert.NoError(config.LoadConfig(ctx, configName+tc.newConfigSuffix, conf))
+			conf, err := loadContainerdConfig(configName + tc.newConfigSuffix)
+			require.NoError(err)
 
 			if !tc.containerdv1 {
 				zeropodConfig, err := os.ReadFile(zeropodRuntimeConfigPath(configName))
@@ -211,7 +225,7 @@ func TestConfigureContainerd(t *testing.T) {
 			assert.NotEmpty(newFile)
 			assert.Equal(tc.expectedRestart, restart)
 
-			hasOpt, containerdOptPath, err := optConfigured(ctx, configName+tc.newConfigSuffix)
+			hasOpt, containerdOptPath, err := optConfigured(configName + tc.newConfigSuffix)
 			require.NoError(err)
 			assert.True(hasOpt)
 			assert.Equal(tc.expectedOptPath, containerdOptPath)
